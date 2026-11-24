@@ -103,35 +103,148 @@ src/
   utils/                    # formato de precios/fechas, mensajes de error (con pruebas)
 ```
 
-## Publicación en GitHub Pages
+## Cómo funciona el código
 
-1. Crear el repositorio `viajes-renato-aravena-PFY2202` en GitHub y subir el código:
-   ```bash
-   git init
-   git add .
-   git commit -m "Proyecto agencia de viajes"
-   git branch -M main
-   git remote add origin https://github.com/<tu-usuario>/viajes-renato-aravena-PFY2202.git
-   git push -u origin main
-   ```
-2. Publicar el sitio: `npm run deploy` (crea la rama `gh-pages` con el contenido de `dist`).
-3. En GitHub: *Settings → Pages* y comprobar que la fuente sea la rama `gh-pages` (carpeta `/ (root)`).
-4. Compartir la URL del repositorio con el docente.
+### Recorrido general
 
-El proyecto usa `base: './'` en `vite.config.js` y `HashRouter`, por lo que funciona en cualquier ruta de GitHub Pages, incluso al recargar la página.
+1. Al abrir la página, `main.jsx` inicia el backend mock (MSW) y después dibuja la aplicación.
+2. `App.jsx` decide qué página mostrar según la ruta (`/`, `/destinos`, `/destinos/:id`).
+3. La página de destinos pide la lista a la API REST (`GET /api/destinos`).
+4. Al elegir un destino se pide su información por REST (`GET /api/destinos/:id`) y, cuando llega, se consultan sus vuelos y hoteles por GraphQL.
+5. El usuario elige un vuelo y un hotel y el resumen calcula el total.
+
+En todos los casos las peticiones salen del navegador como si hubiera un servidor real, pero MSW las intercepta y responde con los datos de `src/mocks/data.js`.
+
+### 1. Arranque (`src/main.jsx`)
+
+Primero se inicia el service worker de MSW y recién después se renderiza React. Así la primera petición ya queda interceptada por el mock:
+
+```js
+await worker.start({
+  serviceWorker: { url: `${import.meta.env.BASE_URL}mockServiceWorker.js` },
+  onUnhandledRequest: 'bypass',
+});
+```
+
+Si el mock no logra iniciar, el error se muestra en consola y la app se dibuja igual (las páginas mostrarán el mensaje de error de conexión).
+
+Luego la aplicación se envuelve en dos proveedores:
+
+- `ApolloProvider`: deja disponible el cliente de GraphQL para usar `useQuery` en cualquier componente.
+- `HashRouter`: maneja la navegación. Se usa la versión con `#` en la URL (por ejemplo `#/destinos/3`) porque GitHub Pages no sabe redirigir rutas como `/destinos/3` a `index.html`, y sin esto la página daría 404 al recargar.
+
+### 2. Rutas (`src/App.jsx`)
+
+`App` arma el esqueleto que se repite en todas las páginas (`Navbar`, contenido y `Footer`) y define las rutas:
+
+| Ruta | Página |
+| --- | --- |
+| `/` | `Home` |
+| `/destinos` | `Destinos` |
+| `/destinos/:id` | `DestinoDetalle` (el `id` se lee con `useParams`) |
+| `*` | `NotFound` (cualquier otra ruta) |
+
+En `Navbar.jsx` los enlaces usan `NavLink`, que indica si la ruta está activa para resaltar el enlace de la página actual. En pantallas chicas el menú se abre y cierra con el estado `menuAbierto`.
+
+### 3. Backend mock (`src/mocks/`)
+
+- `data.js`: los datos de prueba. Un arreglo `destinos` (nombre, país, continente, descripción, actividades y un color) y un objeto `opcionesPorDestino` con los vuelos y hoteles de cada destino, usando el id del destino como clave.
+- `handlers.js`: define qué responde cada petición.
+  - `GET /api/destinos` devuelve la lista completa.
+  - `GET /api/destinos/:id` devuelve un destino, o un error 404 con un mensaje si no existe.
+  - `query ObtenerOpcionesDestino` (GraphQL) devuelve los vuelos y hoteles del destino pedido, o un arreglo `errors` si falta el id o no existe.
+  - Cada respuesta espera unos milisegundos con `delay()` para simular la demora de un servidor real y poder ver los mensajes de carga.
+  - Antes de responder se revisa `sessionStorage.getItem('mock-fallo')` para simular fallas (ver "Probar los errores").
+- `browser.js`: crea el service worker con esos handlers (`setupWorker(...handlers)`).
+
+### 4. Consumo de la API REST
+
+`src/services/api.js` tiene la función `pedirJson`, que usan `obtenerDestinos()` y `obtenerDestino(id)`. Hace el `fetch` y transforma cualquier problema en un error con un mensaje entendible:
+
+- Si no hay conexión, se lanza "No se pudo conectar con el servidor...".
+- Si la respuesta no es `ok` (por ejemplo 404 o 500), se usa el `mensaje` que manda el servidor y se guarda el código en `error.status`.
+- Si la respuesta no es JSON válido, se avisa que el formato no es válido.
+
+En `src/pages/Destinos.jsx` se usa así:
+
+```js
+useEffect(() => {
+  const controlador = new AbortController();
+  async function cargarDestinos() {
+    setCargando(true);
+    setError('');
+    try {
+      const datos = await obtenerDestinos(controlador.signal);
+      if (!Array.isArray(datos)) {
+        throw new Error('La respuesta del servidor no tiene el formato esperado.');
+      }
+      setDestinos(datos);
+    } catch (err) {
+      if (err.name !== 'AbortError') setError(err.message);
+    } finally {
+      if (!controlador.signal.aborted) setCargando(false);
+    }
+  }
+  cargarDestinos();
+  return () => controlador.abort();
+}, [intento]);
+```
+
+- `cargando`, `error` y `destinos` son estados (`useState`) que deciden qué se ve: el componente `Loading`, el `ErrorMessage` o la grilla de tarjetas.
+- El `AbortController` cancela la petición si el usuario se va de la página antes de que termine, para no actualizar un componente que ya no existe.
+- El botón "Reintentar" suma 1 a `intento`. Como `intento` está en las dependencias del `useEffect`, la carga se vuelve a ejecutar.
+- La búsqueda y el filtro por continente son otros dos estados (`busqueda` y `continente`). La lista filtrada no se guarda en un estado aparte: se calcula en cada render a partir de `destinos`, y la lista de continentes del `<select>` se arma con los continentes que vienen en los datos.
+
+Cada destino se dibuja con el componente `DestinoCard`, que tiene un `Link` a `/destinos/:id`.
+
+### 5. Consumo de la API GraphQL
+
+- `src/graphql/client.js` crea el `ApolloClient` apuntando a `/graphql` (que MSW intercepta) con una caché en memoria (`InMemoryCache`).
+- `src/graphql/queries.js` define la consulta `ObtenerOpcionesDestino`. Recibe `destinoId` y pide solo los campos que la interfaz muestra: aerolínea, fechas, duración, escalas, precio y asientos de cada vuelo, y nombre, estrellas, ubicación, precio por noche, fechas y habitaciones de cada hotel.
+
+En `src/pages/DestinoDetalle.jsx` se combinan las dos APIs:
+
+1. Con `useParams` se obtiene el `id` de la URL.
+2. Un `useEffect` con dependencias `[id, intento]` carga el destino por REST (igual que en la lista). Al cambiar de destino también se limpia el vuelo y el hotel elegidos.
+3. Cuando el destino ya llegó, `useQuery` consulta los vuelos y hoteles:
+
+```js
+const {
+  data,
+  loading: cargandoOpciones,
+  error: errorOpciones,
+  refetch,
+} = useQuery(OBTENER_OPCIONES_DESTINO, {
+  variables: { destinoId: id },
+  skip: !destino || String(destino.id) !== id,
+  notifyOnNetworkStatusChange: true,
+});
+```
+
+`skip` evita consultar GraphQL mientras el destino no esté cargado o si falló. `cargandoOpciones` y `errorOpciones` muestran los mismos componentes `Loading` y `ErrorMessage`, y el botón "Reintentar" llama a `refetch()`. El mensaje de error se arma con `mensajeErrorGraphQL` (`src/utils/errores.js`), que distingue entre un error de red y un error devuelto en el campo `errors` de GraphQL.
+
+Si el destino no existe (404) no se muestra el botón "Reintentar", porque volver a pedirlo daría el mismo resultado.
+
+### 6. Selección del viaje y resumen
+
+- `DestinoDetalle` guarda el vuelo y el hotel elegidos en `vueloElegido` y `hotelElegido`. Al hacer clic en una opción ya elegida, se quita (`alternarVuelo` / `alternarHotel`).
+- `VueloCard` y `HotelCard` reciben la opción, si está seleccionada y la función `onSeleccionar`. Si no quedan cupos, el botón queda deshabilitado.
+- `Disponibilidad` muestra la etiqueta de cupos: "Agotado" si es 0, "Quedan N" si quedan 3 o menos, y "N disponibles" en otro caso. Se usa tanto para asientos como para habitaciones.
+- `ResumenViaje` hace los cálculos:
+  - Noches = días entre la salida y el regreso del vuelo (`calcularNoches`).
+  - Total del hotel = precio por noche × noches.
+  - Total estimado = precio del vuelo + total del hotel.
+  - Si las fechas del vuelo no caen dentro de las fechas disponibles del hotel (`rangoDentroDe`), aparece un aviso.
+
+Las funciones de `src/utils/formato.js` dan formato a los precios en pesos chilenos (`$689.000`) y a las fechas (`10 ene 2027`). Las fechas se leen en UTC para que no cambien de día según la zona horaria del computador. Estas funciones tienen pruebas en `formato.test.js`.
+
+### 7. Estilos
+
+Los estilos se hacen con clases de Tailwind directamente en cada componente. Los colores propios del sitio (`primario` y `acento`) están en `tailwind.config.js`, y las clases de botones que se repiten (`boton`, `boton-primario`, `boton-secundario`, `boton-acento`) están en `src/index.css` con `@layer components`. Para el diseño responsivo se usan los prefijos `sm:`, `md:` y `lg:`; por ejemplo, la grilla de destinos pasa de 1 columna en móvil a 2 en tablet y 3 en escritorio.
 
 ## Pruebas realizadas
 
-- Pruebas unitarias con Vitest (`npm test`) de las funciones de formato de precios y fechas, cálculo de noches y rangos de fechas.
-- Pruebas manuales/automatizadas del flujo completo: listar destinos (REST), filtrar, elegir destino, ver vuelos y hoteles (GraphQL), seleccionar opciones y revisar el resumen, navegación y recarga de rutas, página 404.
-- Pruebas de errores: destino inexistente, error 500 de REST, error de GraphQL, caída de red, reintentos.
-- Pruebas en modo desarrollo (`npm run dev`) y sobre el build publicado en una subcarpeta, igual que GitHub Pages.
-- Pruebas de responsividad en 375 px (móvil), 768 px (tablet) y 1440 px (escritorio), sin scroll horizontal.
-- Navegador probado automáticamente: Chromium (motor de Chrome y Edge), sin errores ni advertencias en la consola.
-- Checklist para revisar manualmente en otros navegadores (Firefox, Edge, Safari):
-  - [ ] Se cargan los destinos y funcionan la búsqueda y el filtro.
-  - [ ] Al entrar a un destino se ven sus vuelos y hoteles.
-  - [ ] Se puede elegir vuelo y hotel y el total se calcula bien.
-  - [ ] Los botones atrás/adelante del navegador y recargar la página funcionan.
-  - [ ] Los mensajes de error aparecen al simular fallas (ver "Probar los errores").
-  - [ ] La vista móvil (F12 → modo dispositivo) se ve bien y el menú abre y cierra.
+- Pruebas unitarias con Vitest (`npm test`) para el formato de precios y fechas, el cálculo de noches y los rangos de fechas.
+- Flujo completo: listar y filtrar destinos, entrar a uno, ver sus vuelos y hoteles, elegir opciones y revisar el total.
+- Errores: destino inexistente, error del servidor REST, error de GraphQL y caída de red.
+- Vista en móvil (375 px), tablet (768 px) y escritorio.
