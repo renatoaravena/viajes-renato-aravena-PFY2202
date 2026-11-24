@@ -1,0 +1,40 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-slate-50 text-slate-800 antialiased;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    @apply text-primario-oscuro;
+  }
+
+  :focus-visible {
+    @apply outline outline-[3px] outline-offset-2 outline-acento;
+  }
+}
+
+/* Botones reutilizados en varias páginas */
+@layer components {
+  .boton {
+    @apply inline-block cursor-pointer rounded-md border-2 border-transparent px-4 py-2.5 text-center font-semibold transition-colors;
+    @apply disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-600;
+  }
+
+  .boton-primario {
+    @apply bg-primario text-white hover:bg-primario-oscuro;
+  }
+
+  .boton-secundario {
+    @apply border-primario bg-transparent text-primario hover:bg-primario-claro;
+  }
+
+  .boton-acento {
+    @apply bg-acento text-stone-900 hover:bg-acento-claro;
+  }
+}
